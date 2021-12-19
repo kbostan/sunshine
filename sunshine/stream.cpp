@@ -396,6 +396,7 @@ void control_server_t::iterate(std::chrono::milliseconds timeout) {
 
   if(res > 0) {
     auto session = get_session(event.peer);
+    BOOST_LOG(info) << "Kutlu Rtt is:"sv << event.peer->roundTripTime;
     if(!session) {
       BOOST_LOG(warning) << "Rejected connection from ["sv << platf::from_sockaddr((sockaddr *)&event.peer->address.address) << "]: it's not properly set up"sv;
       enet_peer_disconnect_now(event.peer, 0);
