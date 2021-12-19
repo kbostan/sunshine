@@ -6,6 +6,7 @@
 
 #include <future>
 #include <queue>
+#include <string>
 
 #include <fstream>
 #include <openssl/err.h>
@@ -194,7 +195,7 @@ public:
   //   session refers to broadcast_ctx_t
   //   broadcast_ctx_t refers to control_server_t
   // Therefore, iterate is implemented further down the source file
-  void iterate(std::chrono::milliseconds timeout);
+  void iterate(std::chrono::milliseconds timeout, udp::socket &sock);
 
   void call(std::uint16_t type, session_t *session, const std::string_view &payload);
 
@@ -222,7 +223,6 @@ public:
 
   // Mapping ip:port to session
   util::sync_t<std::unordered_multimap<std::string, std::pair<std::uint16_t, session_t *>>> _map_addr_session;
-
   ENetAddress _addr;
   net::host_t _host;
 };
@@ -234,11 +234,13 @@ struct broadcast_ctx_t {
   std::thread video_thread;
   std::thread audio_thread;
   std::thread control_thread;
-
+  std::thread rtt_thread;
+  
   asio::io_service io;
 
   udp::socket video_sock { io };
   udp::socket audio_sock { io };
+  udp::socket rtt_sock   { io };
 
   // This is purely for adminitrative purposes.
   //
@@ -284,6 +286,10 @@ struct session_t {
 
     audio_fec_packet_t fec_packet;
   } audio;
+
+  struct{
+    udp::endpoint peer;
+  } rtt;
 
   struct {
     crypto::cipher::gcm_t cipher;
@@ -390,13 +396,14 @@ void control_server_t::call(std::uint16_t type, session_t *session, const std::s
   }
 }
 
-void control_server_t::iterate(std::chrono::milliseconds timeout) {
+void control_server_t::iterate(std::chrono::milliseconds timeout, udp::socket &sock) {
   ENetEvent event;
   auto res = enet_host_service(_host.get(), &event, timeout.count());
 
   if(res > 0) {
     auto session = get_session(event.peer);
     BOOST_LOG(info) << "Kutlu Rtt is:"sv << event.peer->roundTripTime;
+    sock.send_to(asio::buffer(std::to_string(event.peer->roundTripTime)), session->rtt.peer);
     if(!session) {
       BOOST_LOG(warning) << "Rejected connection from ["sv << platf::from_sockaddr((sockaddr *)&event.peer->address.address) << "]: it's not properly set up"sv;
       enet_peer_disconnect_now(event.peer, 0);
@@ -588,7 +595,8 @@ int send_rumble(session_t *session, std::uint16_t id, std::uint16_t lowfreq, std
   return 0;
 }
 
-void controlBroadcastThread(control_server_t *server) {
+void controlBroadcastThread(broadcast_ctx_t &ctx) {
+  auto server = ctx.control_server;
   server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
     BOOST_LOG(verbose) << "type [IDX_START_A]"sv;
   });
@@ -1111,6 +1119,7 @@ int start_broadcast(broadcast_ctx_t &ctx) {
   auto control_port = map_port(CONTROL_PORT);
   auto video_port   = map_port(VIDEO_STREAM_PORT);
   auto audio_port   = map_port(AUDIO_STREAM_PORT);
+  auto rtt_port     = map_port(RTT_PORT);
 
   if(ctx.control_server.bind(control_port)) {
     BOOST_LOG(error) << "Couldn't bind Control server to port ["sv << control_port << "], likely another process already bound to the port"sv;
@@ -1146,12 +1155,27 @@ int start_broadcast(broadcast_ctx_t &ctx) {
 
     return -1;
   }
+  // Kutlu : added this
+  ctx.rtt_sock.open(udp::v4(), ec);
+  if(ec) {
+    BOOST_LOG(fatal) << "Couldn't open socket for RTT server: "sv << ec.message();
+
+    return -1;
+  }
+
+  ctx.rtt_sock.bind(udp::endpoint(udp::v4(), rtt_port), ec);
+  if(ec) {
+    BOOST_LOG(fatal) << "Couldn't bind RTT server to port ["sv << rtt_port << "]: "sv << ec.message();
+
+    return -1;
+  }
+
 
   ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
   ctx.video_thread   = std::thread { videoBroadcastThread, std::ref(ctx.video_sock) };
   ctx.audio_thread   = std::thread { audioBroadcastThread, std::ref(ctx.audio_sock) };
-  ctx.control_thread = std::thread { controlBroadcastThread, &ctx.control_server };
+  ctx.control_thread = std::thread { controlBroadcastThread, std::ref(ctx) };
 
   ctx.recv_thread = std::thread { recvThread, std::ref(ctx) };
 
@@ -1175,6 +1199,7 @@ void end_broadcast(broadcast_ctx_t &ctx) {
 
   ctx.video_sock.close();
   ctx.audio_sock.close();
+  ctx.rtt_sock.close();
 
   video_packets.reset();
   audio_packets.reset();
@@ -1185,6 +1210,8 @@ void end_broadcast(broadcast_ctx_t &ctx) {
   ctx.video_thread.join();
   BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
   ctx.audio_thread.join();
+  BOOST_LOG(debug) << "Waiting for rtt control thread to end..."sv;
+  ctx.rtt_thread.join();
   BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
   ctx.control_thread.join();
   BOOST_LOG(debug) << "All broadcasting threads ended"sv;
@@ -1376,6 +1403,9 @@ int start(session_t &session, const std::string &addr_string) {
 
   session.audio.peer.address(addr);
   session.audio.peer.port(0);
+
+  session.rtt.peer.address(addr);
+  session.rtt.peer.port(0);
 
   {
     auto &connections = session.broadcast_ref->audio_video_connections;
