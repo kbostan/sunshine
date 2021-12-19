@@ -234,7 +234,6 @@ struct broadcast_ctx_t {
   std::thread video_thread;
   std::thread audio_thread;
   std::thread control_thread;
-  std::thread rtt_thread;
   
   asio::io_service io;
 
@@ -402,8 +401,13 @@ void control_server_t::iterate(std::chrono::milliseconds timeout, udp::socket &s
 
   if(res > 0) {
     auto session = get_session(event.peer);
-    BOOST_LOG(info) << "Kutlu Rtt is:"sv << event.peer->roundTripTime;
-    sock.send_to(asio::buffer(std::to_string(event.peer->roundTripTime)), session->rtt.peer);
+    
+    //now fixed port fix kutlu
+    BOOST_LOG(info) << "Kutlu Rtt is:"sv << event.peer->roundTripTime << "peer address:"sv << session->rtt.peer.address().to_string() << "peer port:"sv << session->rtt.peer.port();
+    if(sock.send_to(asio::buffer(std::to_string(event.peer->roundTripTime)), session->rtt.peer) <= 0){
+      BOOST_LOG(info) << "Kutlu could not send Rtt"sv;
+    }
+    
     if(!session) {
       BOOST_LOG(warning) << "Rejected connection from ["sv << platf::from_sockaddr((sockaddr *)&event.peer->address.address) << "]: it's not properly set up"sv;
       enet_peer_disconnect_now(event.peer, 0);
@@ -596,7 +600,7 @@ int send_rumble(session_t *session, std::uint16_t id, std::uint16_t lowfreq, std
 }
 
 void controlBroadcastThread(broadcast_ctx_t &ctx) {
-  auto server = ctx.control_server;
+  auto server = &(ctx.control_server);
   server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
     BOOST_LOG(verbose) << "type [IDX_START_A]"sv;
   });
@@ -772,7 +776,7 @@ void controlBroadcastThread(broadcast_ctx_t &ctx) {
       break;
     }
 
-    server->iterate(150ms);
+    server->iterate(150ms, ctx.rtt_sock);
   }
 
   // Let all remaining connections know the server is shutting down
@@ -844,6 +848,9 @@ void recvThread(broadcast_ctx_t &ctx) {
         else {
           peer_to_audio_session.erase(addr);
         }
+        break;
+      
+      default:
         break;
       }
     }
@@ -1210,8 +1217,6 @@ void end_broadcast(broadcast_ctx_t &ctx) {
   ctx.video_thread.join();
   BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
   ctx.audio_thread.join();
-  BOOST_LOG(debug) << "Waiting for rtt control thread to end..."sv;
-  ctx.rtt_thread.join();
   BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
   ctx.control_thread.join();
   BOOST_LOG(debug) << "All broadcasting threads ended"sv;
@@ -1398,14 +1403,15 @@ int start(session_t &session, const std::string &addr_string) {
   session.broadcast_ref->control_server.emplace_addr_to_session(addr_string, session);
 
   auto addr = boost::asio::ip::make_address(addr_string);
+  auto addrLoop = boost::asio::ip::make_address("127.0.0.1");
   session.video.peer.address(addr);
   session.video.peer.port(0);
 
   session.audio.peer.address(addr);
   session.audio.peer.port(0);
 
-  session.rtt.peer.address(addr);
-  session.rtt.peer.port(0);
+  session.rtt.peer.address(addrLoop);
+  session.rtt.peer.port(3162);
 
   {
     auto &connections = session.broadcast_ref->audio_video_connections;
